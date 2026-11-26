@@ -3341,7 +3341,7 @@ class LPCMCI(PCMCIbase):
         # Find adjacencies going forward/contemp
         for k, lag_ik in zip(*np.where(graph[i,:,:])):  
             matches = [self._match_link(patt, graph[i, k, lag_ik]) for patt in patterns]
-            if np.any(matches):
+            if any(matches):
                 match = (k, lag_i + lag_ik)
                 if match not in adj and (k, lag_i + lag_ik) not in exclude and (-self.tau_max <= lag_i + lag_ik <= 0 or ignore_time_bounds):
                     adj.append(match)
@@ -3349,7 +3349,7 @@ class LPCMCI(PCMCIbase):
         # Find adjacencies going backward/contemp
         for k, lag_ki in zip(*np.where(graph[:,i,:])):  
             matches = [self._match_link(self._reverse_link(patt), graph[k, i, lag_ki]) for patt in patterns]
-            if np.any(matches):
+            if any(matches):
                 match = (k, lag_i - lag_ki)
                 if match not in adj and (k, lag_i - lag_ki) not in exclude and (-self.tau_max <= lag_i - lag_ki <= 0 or ignore_time_bounds):
                     adj.append(match)
@@ -3380,7 +3380,12 @@ class LPCMCI(PCMCIbase):
         # print("matching ", pattern_ij, pattern_jk, pattern_ik)
 
         matched_triples = []
-                
+        # Membership only; matched_triples keeps the output order
+        seen = set()
+        # Adjacencies of j w.r.t. pattern_jk on this fixed graph; filtering out (i, lag_i)
+        # afterwards gives the same ordered list as passing exclude=[(i, lag_i)]
+        adjacency_cache = {}
+
         for i in range(self.N):
             # Set lag_i = 0 without loss of generality, will be adjusted at end
             lag_i = 0
@@ -3388,8 +3393,9 @@ class LPCMCI(PCMCIbase):
             # print(i, adjacencies_i)
             for (j, lag_j) in adjacencies_i:
 
-                adjacencies_j = self._find_adj(graph, (j, lag_j), pattern_jk,
-                                          exclude=[(i, lag_i)])
+                if (j, lag_j) not in adjacency_cache:
+                    adjacency_cache[(j, lag_j)] = self._find_adj(graph, (j, lag_j), pattern_jk)
+                adjacencies_j = [adj for adj in adjacency_cache[(j, lag_j)] if adj != (i, lag_i)]
                 # print(j, adjacencies_j)
                 for (k, lag_k) in adjacencies_j:
                     if self._is_match(graph, (i, lag_i), (k, lag_k), pattern_ik):                            
@@ -3400,9 +3406,10 @@ class LPCMCI(PCMCIbase):
                                  (j, lag_j - righmost_lag),
                                  (k, lag_k - righmost_lag))
                         largest_lag = min(lag_i - righmost_lag, lag_j - righmost_lag, lag_k - righmost_lag)
-                        if match not in matched_triples and \
+                        if match not in seen and \
                             -self.tau_max <= largest_lag <= 0:
-                            matched_triples.append(match)                       
+                            matched_triples.append(match)
+                            seen.add(match)
                 
         return matched_triples  
 
@@ -3418,7 +3425,8 @@ class LPCMCI(PCMCIbase):
         graph = self._dict2graph()
 
         matched_quadruples = []
-                
+        seen = set()
+
         # First get triple ijk
         ijk_triples = self._find_triples(pattern_ij, pattern_jk, pattern_ik)
 
@@ -3461,9 +3469,10 @@ class LPCMCI(PCMCIbase):
                                   lag_k - righmost_lag,
                                   lag_l - righmost_lag,
                                   )
-                if match not in matched_quadruples and \
+                if match not in seen and \
                     -self.tau_max <= largest_lag <= 0:
-                    matched_quadruples.append(match)                       
+                    matched_quadruples.append(match)
+                    seen.add(match)
                 
         return matched_quadruples 
 
@@ -3515,6 +3524,38 @@ class LPCMCI(PCMCIbase):
 
         assert start_node != end_node
 
+        # The graph is not modified during this search, so the admissible next nodes of a node
+        # (time frame and link-pattern checks) depend only on (node, allowed_patterns). Compute
+        # them once per call, in adjacency order; only the path-dependent checks remain per path.
+        transitions = {}
+
+        def _transitions(start_node, allowed_patterns):
+            key = (start_node, tuple(allowed_patterns))
+            if key not in transitions:
+                out = []
+                for (var, lag) in self.graph_full_dict[start_node[0]].keys():
+
+                    next_node = (var, lag + start_node[1])
+
+                    # Consider only nodes that are within the allowed time frame ...
+                    if next_node[1] < -self.tau_max or next_node[1] > 0:
+                        continue
+                    # ... and whose link with start_node matches one of the allowed patters
+                    link = self._get_link(start_node, next_node)
+                    if not any([self._match_link(pattern = pattern, link = link) for pattern in allowed_patterns]):
+                        continue
+
+                    # Determine the allowed patters for the next recursive call
+                    # (allowed patterns are always among 'o*o', 'o*>', '-*>', so one branch applies)
+                    if self._match_link(pattern='o*o', link=link):
+                        new_allowed_patters = ["o*o", "o*>", "-*>"]
+                    elif self._match_link(pattern='o*>', link=link) or self._match_link(pattern='-*>', link=link):
+                        new_allowed_patters = ["-*>"]
+
+                    out.append((next_node, new_allowed_patters))
+                transitions[key] = out
+            return transitions[key]
+
         # Function for recursive search of potentially directed uncovered paths
         def _search(end_node, path_taken, allowed_patterns):
 
@@ -3530,32 +3571,16 @@ class LPCMCI(PCMCIbase):
 
             # Recursive build case
             else:
-                # Run through the adjacencies of start_node
-                #for next_node in self.graph_full_dict[start_node[0]]:
-                for (var, lag) in self.graph_full_dict[start_node[0]].keys():
-
-                    next_node = (var, lag + start_node[1])
+                # Run through the admissible adjacencies of start_node
+                for next_node, new_allowed_patters in _transitions(start_node, allowed_patterns):
 
                     # Consider only nodes that ...
-                    # ... are within the allowed time frame
-                    if next_node[1] < -self.tau_max or next_node[1] > 0:
-                        continue
                     # ... have not been visited yet
                     if next_node in path_taken:
                         continue
                     # ... are non-adjacent to the node before start_node
                     if len(path_taken) >= 2 and self._get_link(path_taken[-2], next_node) != "":
                         continue
-                    # ... whose link with start_node matches one of the allowed patters
-                    link = self._get_link(start_node, next_node)
-                    if not any([self._match_link(pattern = pattern, link = link) for pattern in allowed_patterns]):
-                        continue
-
-                    # Determine the allowed patters for the next recursive call
-                    if self._match_link(pattern='o*o', link=link):
-                        new_allowed_patters = ["o*o", "o*>", "-*>"]
-                    elif self._match_link(pattern='o*>', link=link) or self._match_link(pattern='-*>', link=link):
-                        new_allowed_patters = ["-*>"]
 
                     # Determine the new path taken
                     new_path_taken = path_taken[:] + [next_node]

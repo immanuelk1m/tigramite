@@ -4,7 +4,6 @@ License: GNU General Public License v3.0 (see license.txt).
 """
 
 import math
-from hashlib import sha1
 
 import numpy as np
 from scipy.special import stdtr
@@ -70,9 +69,9 @@ class ParCorrFast(ParCorr):
                 or not np.issubdtype(refs.dtype, np.integer)):
             return False
         # Check content, not just object identity: DataFrame is publicly mutable.
+        # Exact C-order bytes (what the former SHA-1 digests hashed), compared directly.
         state = (tau_max, dataset, values.shape, refs.shape, refs.dtype.str,
-                 sha1(np.ascontiguousarray(values)).digest(),
-                 sha1(np.ascontiguousarray(refs)).digest())
+                 values.tobytes(), refs.tobytes())
         if state == self._state:
             return self._gram is not None
         self._state, self._gram, self._fast_cache = state, None, {}
@@ -106,7 +105,8 @@ class ParCorrFast(ParCorr):
         xx, yy, xy = g[x, x], g[y, y], g[x, y]
         if len(ids) > 2:
             z = ids[2:]
-            zz, za = g[np.ix_(z, z)], g[np.ix_(z, [x, y])]
+            rows = np.array(z)[:, None]  # same selection as np.ix_, less overhead
+            zz, za = g[rows, z], g[rows, [x, y]]
             try:
                 eig = np.linalg.eigvalsh(zz)
                 if eig[0] <= 0 or eig[-1]/eig[0] > 1e5:
@@ -133,7 +133,10 @@ class ParCorrFast(ParCorr):
                 or not self._prepare(tau_max)):
             return fallback(X, Y, Z, tau_max, cut_off, alpha_or_thres)
         nodes = list(X) + list(Y) + (list(Z) if Z is not None else [])
-        if any(not isinstance(node, tuple) or len(node) != 2
+        # Fast path for the usual (int, int) nodes; anything else gets the full check.
+        if not all(type(node) is tuple and len(node) == 2
+                   and type(node[0]) is int and type(node[1]) is int for node in nodes) \
+           and any(not isinstance(node, tuple) or len(node) != 2
                or any(not isinstance(v, (int, np.integer)) or isinstance(v, (bool, np.bool_))
                       for v in node) for node in nodes):
             return fallback(X, Y, Z, tau_max, cut_off, alpha_or_thres)
