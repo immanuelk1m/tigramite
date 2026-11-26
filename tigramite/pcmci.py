@@ -2807,16 +2807,11 @@ class PCMCI(PCMCIbase):
     def _remaining_pairs(self, graph, adjt, tau_min, tau_max, p):
         """Helper function returning the remaining pairs that still need to be
         tested."""
-        N = graph.shape[0]
-        pairs = []
-        for (i, j) in itertools.product(range(N), range(N)):
-            for abstau in range(tau_min, tau_max + 1):
-                if (graph[i, j, abstau] != ""
-                        and len(
-                            [a for a in adjt[j] if a != (i, -abstau)]) >= p):
-                    pairs.append((i, j, abstau))
-
-        return pairs
+        # Present links in (i, j, abstau) order, as Python ints; len - count equals the former
+        # filtered-list length without building it.
+        present = np.argwhere(graph[:, :, tau_min:tau_max + 1] != "").tolist()
+        return [(i, j, lag + tau_min) for i, j, lag in present
+                if len(adjt[j]) - adjt[j].count((i, -(lag + tau_min))) >= p]
 
     def _pcalg_skeleton(self,
                        initial_graph,
@@ -2927,15 +2922,17 @@ class PCMCI(PCMCIbase):
 
         # Start with zero cardinality conditions
         p = 0
-        while (self._any_tests_remaining(graph, adjt, tau_min, tau_max,
-                                         p) and p <= max_conds_dim):
+        while p <= max_conds_dim:
+            # Computed once per cardinality (formerly also by _any_tests_remaining)
+            remaining_pairs = self._remaining_pairs(graph, adjt, tau_min,
+                                                    tau_max, p)
+            if not remaining_pairs:
+                break
             if self.verbosity > 1:
                 print(
                     "\nTesting contemporaneous condition sets of dimension "
                     "%d: " % p)
 
-            remaining_pairs = self._remaining_pairs(graph, adjt, tau_min,
-                                                    tau_max, p)
             n_remaining = len(remaining_pairs)
             for ir, (i, j, abstau) in enumerate(remaining_pairs):
                 # Check if link was not already removed (contemp links)

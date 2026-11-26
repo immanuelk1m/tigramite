@@ -3319,10 +3319,12 @@ class LPCMCI(PCMCIbase):
         """Convert self.graph_dict to graph array of shape (N, N, self.tau_max + 1)."""
 
         graph = np.zeros((self.N, self.N, self.tau_max + 1), dtype='U3')
-        for j in range(self.N):
-            for adj in self.graph_dict[j]:
-                (i, lag_i) = adj
-                graph[i, j, abs(lag_i)] = self.graph_dict[j][adj]
+        # One fancy-index write; (i, j, |lag|) are unique and absent links already hold "".
+        entries = [(i, j, abs(lag_i), link) for j in range(self.N)
+                   for (i, lag_i), link in self.graph_dict[j].items() if link != ""]
+        if entries:
+            ii, jj, ll, links = zip(*entries)
+            graph[ii, jj, ll] = links
 
         return graph
 
@@ -3339,17 +3341,18 @@ class LPCMCI(PCMCIbase):
         # Init
         adj = []
         # Find adjacencies going forward/contemp
-        for k, lag_ik in zip(*np.where(graph[i,:,:])):  
-            matches = [self._match_link(patt, graph[i, k, lag_ik]) for patt in patterns]
-            if any(matches):
+        for k, lag_ik in zip(*np.where(graph[i,:,:])):
+            link = graph[i, k, lag_ik]
+            if any([self._match_link(patt, link) for patt in patterns]):
                 match = (k, lag_i + lag_ik)
                 if match not in adj and (k, lag_i + lag_ik) not in exclude and (-self.tau_max <= lag_i + lag_ik <= 0 or ignore_time_bounds):
                     adj.append(match)
         
         # Find adjacencies going backward/contemp
-        for k, lag_ki in zip(*np.where(graph[:,i,:])):  
-            matches = [self._match_link(self._reverse_link(patt), graph[k, i, lag_ki]) for patt in patterns]
-            if any(matches):
+        reversed_patterns = [self._reverse_link(patt) for patt in patterns]
+        for k, lag_ki in zip(*np.where(graph[:,i,:])):
+            link = graph[k, i, lag_ki]
+            if any([self._match_link(patt, link) for patt in reversed_patterns]):
                 match = (k, lag_i - lag_ki)
                 if match not in adj and (k, lag_i - lag_ki) not in exclude and (-self.tau_max <= lag_i - lag_ki <= 0 or ignore_time_bounds):
                     adj.append(match)
@@ -3556,46 +3559,54 @@ class LPCMCI(PCMCIbase):
                 transitions[key] = out
             return transitions[key]
 
-        # Function for recursive search of potentially directed uncovered paths
-        def _search(end_node, path_taken, allowed_patterns):
+        # Shielding (adjacency to the node before start_node) is fixed during the search too:
+        # memoize the unshielded transitions per (previous, node, allowed_patterns), same order.
+        # The previous node itself is always visited, so excluding it here changes nothing.
+        unshielded = {}
 
-            # List for outputting potentially directed uncovered paths
-            paths = []
+        def _unshielded(previous, start_node, allowed_patterns):
+            key = (previous, start_node, tuple(allowed_patterns))
+            if key not in unshielded:
+                unshielded[key] = [(next_node, patterns) for next_node, patterns
+                                   in _transitions(start_node, allowed_patterns)
+                                   if previous is None or (next_node != previous
+                                       and self._get_link(previous, next_node) == "")]
+            return unshielded[key]
+
+        # Depth-first search on one shared path buffer; paths are emitted in the same order as
+        # the former recursive list-building version, each as its own list (callers mutate them).
+        path, visited, paths = [start_node], {start_node}, []
+
+        def _search(allowed_patterns):
 
             # The last visited note becomes the new start_node
-            start_node = path_taken[-1]
+            start_node = path[-1]
 
             # Base case: End node has been reached
             if start_node == end_node:
-                paths.append(path_taken)
+                if len(path) > 2:
+                    paths.append(path.copy())
+                return
 
-            # Recursive build case
-            else:
-                # Run through the admissible adjacencies of start_node
-                for next_node, new_allowed_patters in _transitions(start_node, allowed_patterns):
+            previous = path[-2] if len(path) >= 2 else None
 
-                    # Consider only nodes that ...
-                    # ... have not been visited yet
-                    if next_node in path_taken:
-                        continue
-                    # ... are non-adjacent to the node before start_node
-                    if len(path_taken) >= 2 and self._get_link(path_taken[-2], next_node) != "":
-                        continue
+            # Run through the admissible adjacencies of start_node that are non-adjacent to
+            # the node before start_node ...
+            for next_node, new_allowed_patters in _unshielded(previous, start_node, allowed_patterns):
 
-                    # Determine the new path taken
-                    new_path_taken = path_taken[:] + [next_node]
+                # ... and have not been visited yet
+                if next_node in visited:
+                    continue
 
-                    # Recursive call
-                    paths.extend(_search(end_node, new_path_taken, new_allowed_patters))
-
-            # Output list of potentially directed uncovered paths
-            return paths
-
-        # end def _search(end_node, path_taken, allowed_patterns)
+                path.append(next_node)
+                visited.add(next_node)
+                _search(new_allowed_patters)
+                path.pop()
+                visited.remove(next_node)
 
         # Output potentially directed uncovered paths
-        paths = _search(end_node, [start_node], initial_allowed_patterns)
-        return [path for path in paths if len(path) > 2]
+        _search(initial_allowed_patterns)
+        return paths
 
 
     def _sort_search_set(self, search_set, reference_node):
