@@ -68,10 +68,12 @@ class ParCorrFast(ParCorr):
                 or not isinstance(refs, np.ndarray) or refs.ndim != 1
                 or not np.issubdtype(refs.dtype, np.integer)):
             return False
-        # Check content, not just object identity: DataFrame is publicly mutable.
-        # Exact C-order bytes (what the former SHA-1 digests hashed), compared directly.
+        # Keep the first array's serialization order for this DataFrame so that
+        # equal values still hit the cache if the array's memory layout changes.
+        if self._state is None:
+            self._snapshot_order = 'F' if values.flags.f_contiguous else 'C'
         state = (tau_max, dataset, values.shape, refs.shape, refs.dtype.str,
-                 values.tobytes(), refs.tobytes())
+                 values.tobytes(order=self._snapshot_order), refs.tobytes())
         if state == self._state:
             return self._gram is not None
         self._state, self._gram, self._fast_cache = state, None, {}

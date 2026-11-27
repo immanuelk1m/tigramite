@@ -136,6 +136,27 @@ def test_cache_invalidation_without_freezing_input(change):
                                       b.dataframe.use_indices_dataset_dict[key])
 
 
+@pytest.mark.parametrize('order', ['C', 'F'])
+def test_cache_reuses_gram_across_layout_changes(order):
+    values = np.random.default_rng(8).normal(size=(52, 4))
+    a, b = attached(values)
+    b.set_dataframe(DataFrame(values.copy(order=order)))
+    q = query()
+    _, expected = compare_test(a, b, **q)
+    original_gram = b._gram
+    assert b._snapshot_order == order
+
+    other_order = 'F' if order == 'C' else 'C'
+    b.dataframe.values[0] = values.copy(order=other_order)
+    assert b.run_test(**q) == expected
+    assert b._gram is original_gram
+
+    for test in (a, b):
+        test.dataframe.values[0][-20:, 1] += 7.
+    compare_test(a, b, **q)
+    assert b._gram is not original_gram
+
+
 def test_cache_hits_deduplication_and_alpha_guard():
     a, b = attached(np.random.default_rng(20).normal(size=(52, 4)))
     q = query(); q['Z'] += [q['Z'][0], q['X'][0], q['Y'][0]]
