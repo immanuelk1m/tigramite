@@ -201,36 +201,38 @@ class RPCMCI(PCMCI):
 
             # Define eta, auxiliary vars for constr. (2).
             E = [solver.NumVar(0, infinity, f"eta_{i}") for i in range(num_regimes * T - 1)]
-            X = G + E
-            solver.Minimize(
-                sum([resid_sq[k, t] * X[k * T + t] for k in range(num_regimes) for t in range(T)])
-            )
+            # Match the existing GLOP model, including duplicate persistence
+            # rows and coefficient order, without building Python linear expressions.
+            objective = solver.Objective()
+            objective.SetMinimization()
+            for variable, coefficient in zip(G, resid_sq.flat):
+                objective.SetCoefficient(variable, 0.0 + float(coefficient))
 
-            con_lst = [sum([X[k * T + t] for k in range(num_regimes)]) for t in range(T)]
             for t in range(T):
-                solver.Add(con_lst[t] == 1)
+                constraint = solver.RowConstraint(1, 1, "")
+                for k in range(num_regimes):
+                    constraint.SetCoefficient(G[k * T + t], 1.0)
 
+            upper_bound = infinity
+            if num_regimes and T > 1 and max_transitions < infinity:
+                upper_bound = max_transitions - 0.0
             for k in range(num_regimes):
-                for t in range(T - 1):
-                    # (2.1)
-                    solver.Add(
-                        (X[k * T + t + 1] - X[k * T + t] - X[k * T + t + num_regimes * T] <= 0)
-                    )
-                    # (2.2)
-                    solver.Add(
-                        (
-                            (
-                                    -1 * X[k * T + t + 1]
-                                    + X[k * T + t]
-                                    - X[k * T + t + num_regimes * T]
-                                    <= 0
-                            )
-                        )
-                    )
-                    # (2.3)
-                    solver.Add(
-                        ((sum([X[k * T + t + num_regimes * T] for t in range(T - 1)]) <= max_transitions))
-                    )
+                offset = k * T
+                eta_variables = E[offset:offset + T - 1]
+                for t, eta in enumerate(eta_variables):
+                    left, right = G[offset + t], G[offset + t + 1]
+                    constraint = solver.RowConstraint(-infinity, 0, "")
+                    constraint.SetCoefficient(right, 1.0)
+                    constraint.SetCoefficient(left, -1.0)
+                    constraint.SetCoefficient(eta, -1.0)
+                    constraint = solver.RowConstraint(-infinity, 0, "")
+                    constraint.SetCoefficient(right, -1.0)
+                    constraint.SetCoefficient(left, 1.0)
+                    constraint.SetCoefficient(eta, -1.0)
+
+                    constraint = solver.RowConstraint(-infinity, upper_bound, "")
+                    for eta_variable in eta_variables:
+                        constraint.SetCoefficient(eta_variable, 1.0)
 
             status = solver.Solve()
             if status == pywraplp.Solver.OPTIMAL:
