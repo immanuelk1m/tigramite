@@ -6,11 +6,20 @@
 
 from __future__ import print_function
 from scipy import stats
+from scipy import __version__ as scipy_version
+import os
 import numpy as np
 import sys
 import warnings
+from scipy.special import stdtr
 
 from .independence_tests_base import CondIndTest
+
+# This path preserves the operation order of the verified SciPy implementation.
+_PEARSON_NUMPY = (scipy_version == '1.18.1' and np.__version__ == '2.5.5'
+                  and not os.environ.get('SCIPY_ARRAY_API'))
+_ORIGINAL_PEARSONR = stats.pearsonr
+
 
 class ParCorr(CondIndTest):
     r"""Partial correlation test.
@@ -143,6 +152,33 @@ class ParCorr(CondIndTest):
 
         x_vals = self._get_single_residuals(array, target_var=0)
         y_vals = self._get_single_residuals(array, target_var=1)
+        if (_PEARSON_NUMPY and stats.pearsonr is _ORIGINAL_PEARSONR
+                and type(self) is ParCorr
+                and type(x_vals) is np.ndarray and type(y_vals) is np.ndarray
+                and x_vals.dtype == np.float64 and y_vals.dtype == np.float64
+                and x_vals.ndim == y_vals.ndim == 1
+                and x_vals.size == y_vals.size and x_vals.size > 2
+                and np.isfinite(x_vals).all() and np.isfinite(y_vals).all()):
+            x_mean = x_vals.mean(keepdims=True)
+            y_mean = y_vals.mean(keepdims=True)
+            x_centered = x_vals - x_mean
+            y_centered = y_vals - y_mean
+            x_scale = np.max(np.abs(x_centered), keepdims=True)
+            y_scale = np.max(np.abs(y_centered), keepdims=True)
+            if (np.isfinite(x_scale[0]) and np.isfinite(y_scale[0])
+                    and x_scale[0] > 0. and y_scale[0] > 0.):
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    x_norm = x_scale * np.linalg.norm(
+                        x_centered / x_scale, axis=-1, keepdims=True)
+                    y_norm = y_scale * np.linalg.norm(
+                        y_centered / y_scale, axis=-1, keepdims=True)
+                threshold = np.finfo(np.float64).eps ** 0.75
+                if (x_norm[0] >= threshold * abs(x_mean[0])
+                        and y_norm[0] >= threshold * abs(y_mean[0])):
+                    with np.errstate(invalid='ignore', divide='ignore'):
+                        value = np.vecdot(x_centered / x_norm,
+                                          y_centered / y_norm, axis=-1)
+                    return np.clip(value, -1., 1.)
         val, _ = stats.pearsonr(x_vals, y_vals)
         return val
 
@@ -228,7 +264,14 @@ class ParCorr(CondIndTest):
         else:
             trafo_val = value * np.sqrt(deg_f/(1. - value*value))
             # Two sided significance level
-            pval = stats.t.sf(np.abs(trafo_val), deg_f) * 2
+            if (type(trafo_val) in (float, np.float64, np.float32)
+                    and isinstance(deg_f, (int, np.integer))
+                    and (not isinstance(deg_f, int) or deg_f < 2**64)
+                    and np.isfinite(trafo_val)):
+                # Match t.sf's float64 promotion for ordinary scalar inputs.
+                pval = stdtr(deg_f, -np.float64(np.abs(trafo_val))) * 2
+            else:
+                pval = stats.t.sf(np.abs(trafo_val), deg_f) * 2
 
         return pval
 

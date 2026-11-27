@@ -286,6 +286,17 @@ class CondIndTest():
         
         if remove_constant_data:
             zero_components = np.where(array.std(axis=1)==0.)[0]
+            if (zero_components.size == 0 and type(array) is np.ndarray
+                    and type(xyz) is np.ndarray
+                    and (type_array is None or type(type_array) is np.ndarray)):
+                # np.delete with an empty row index returns an independent
+                # C-contiguous copy, even when the input is Fortran ordered.
+                nonzero_array = array.copy(order='C')
+                nonzero_xyz = xyz.copy()
+                nonzero_XYZ = tuple(list(nodes) for nodes in XYZ)
+                nonzero_type_array = None if type_array is None else type_array.copy(order='C')
+                return (array, xyz, XYZ, type_array, nonzero_array,
+                        nonzero_xyz, nonzero_XYZ, nonzero_type_array)
 
             X, Y, Z = XYZ
             x_indices = np.where(xyz == 0)[0]

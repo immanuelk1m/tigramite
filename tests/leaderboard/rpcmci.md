@@ -57,3 +57,58 @@ rpcmci_benchmark=(
 "${rpcmci_benchmark[@]}" > /tmp/rpcmci-individual.json
 "${rpcmci_benchmark[@]}" --variants 1+2+3+4ci+4pred --current > /tmp/rpcmci-final.json
 ```
+
+## 2차 ablation · 기준 `f788f5d`
+
+T, M, R과 실행 환경은 1차와 같습니다. 각 변형을 워밍업하고 실행 순서를 바꾸며 10회씩 측정했습니다. 기준은 1차 GLOP 직접 계수 구성까지 적용된 커밋 `f788f5d1853c04b8645d75708d7bdf8c5bc25801`입니다.
+
+| 후보 | 변경 | 출력 보존 |
+|---|---|---|
+| LP | annealing별 protobuf 모델 템플릿 재사용 | 목적 계수를 매번 갱신하고 새 GLOP solver에서 풉니다. 중복 행과 순서를 유지하며 비표준 수치 경계에서는 기존 메서드를 사용합니다. |
+| Pearson | ParCorr에서 Pearson 통계량만 계산 | 검증한 NumPy 2.5.5 / SciPy 1.18.1의 기본 환경과 유한 float64 잔차에서만 적용합니다. 다른 버전과 경계 입력은 SciPy 경로를 사용합니다. |
+| p값 | 일반 스칼라 t 분포에 `stdtr` 직접 사용 | t 통계량 계산 순서와 결과 타입을 유지하고 비유한 값, 일반 경로 밖의 타입·자유도를 기존 함수로 전달합니다. |
+| CI 배열 | 상수 행이 없을 때 열거와 삭제를 건너뜀 | 결과 배열과 노드 목록을 독립적으로 복사하고 기존 `np.delete`가 반환하는 메모리 배치를 유지합니다. |
+
+### 최종 조합과 제외 실험
+
+시간은 밀리초 단위의 중앙값 / IQR입니다. 마지막 열은 M에서 해당 후보를 다시 포함했을 때의 짝지은 개선율과 95% 부트스트랩 신뢰구간입니다. 이 비교 동안 회귀 테스트는 별도 CPU 코어에 제한해 병행했습니다.
+
+| 변형 | T 시간 | M 시간 | R 시간 | M에서 후보를 다시 포함했을 때 | 출력 |
+|---|---:|---:|---:|---:|---|
+| 기준 | 953.59 / 34.54 | 1,371.20 / 159.92 | 23.36 / 0.92 | — | 완전 일치 |
+| 최종 · 네 후보 | 398.52 / 20.10 | 650.19 / 75.52 | 13.67 / 1.05 | — | 완전 일치 |
+| LP만 | 465.60 / 39.08 | 1,332.76 / 252.70 | 19.52 / 0.88 | — | 완전 일치 |
+| LP 제외 | 899.19 / 42.21 | 658.74 / 82.90 | 18.85 / 1.16 | +1.27% [-2.01, +5.03] | 완전 일치 |
+| Pearson 제외 | 459.53 / 25.13 | 1,110.99 / 161.33 | 16.91 / 0.90 | +41.22% [+39.35, +43.82] | 완전 일치 |
+| p값 제외 | 431.40 / 33.05 | 798.23 / 131.77 | 14.47 / 0.98 | +18.55% [+14.00, +19.71] | 완전 일치 |
+| CI 배열 제외 | 420.75 / 27.60 | 717.59 / 107.66 | 14.84 / 1.06 | +8.06% [+5.21, +13.41] | 완전 일치 |
+
+LP를 다시 포함하면 T가 **55.39%** [53.24, 56.40] 개선됐습니다. Pearson, p값, CI 배열은 M에서 각각 개선 효과가 확인됐습니다. 이 결과를 바탕으로 네 후보를 모두 반영했습니다.
+
+- 직렬, 병렬, 결측값, 표본 부족에서 RPCMCI 전체 반환값을 바이트 단위로 비교했습니다. LP 217개 입력을 각각 기존 목적 계수와 0으로 초기화한 계수로 풀어 434건의 모델·해를 비교했습니다.
+- Python 3.11, NumPy 1.24.4, SciPy 1.10.1, OR-Tools 9.6.2534 조합에서도 기준과 최종의 모든 출력 및 LP 434건이 일치했습니다. 이 환경에서는 Pearson이 기존 SciPy 경로를 사용합니다.
+- 관련 회귀 테스트 274개가 통과했습니다. 이전 의존성 조합에서는 RPCMCI 회귀 테스트 26개도 통과했습니다.
+
+### 최종 라이브러리 단독 재측정
+
+회귀 테스트가 끝난 뒤 기준과 최종 라이브러리만 10회씩 교대로 다시 측정했습니다. 모든 회차의 출력이 일치했습니다.
+
+| 입력 | 기준 (ms) | 최종 (ms) | 배속 | 개선율 [95% CI, %p] |
+|---|---:|---:|---:|---:|
+| T | 729.80 | 296.16 | 2.46× | +59.52% [+58.90, +60.69] |
+| M | 1,227.90 | 568.87 | 2.16× | +54.11% [+53.50, +54.51] |
+| R | 23.61 | 13.49 | 1.75× | +43.28% [+42.46, +44.40] |
+
+### 2차 재현
+
+위의 `rpcmci_benchmark` 배열을 사용합니다. `--baseline f788f5d`는 이 저장소의 1차 커밋을 가리킵니다.
+
+```bash
+"${rpcmci_benchmark[@]}" --baseline f788f5d --patches tests/leaderboard/rpcmci_round2_variants.json \
+  --variants lp pearson pvalue array > /tmp/rpcmci-round2-individual.json
+"${rpcmci_benchmark[@]}" --baseline f788f5d --patches tests/leaderboard/rpcmci_round2_variants.json \
+  --variants lp pearson+pvalue+array lp+pvalue+array lp+pearson+array lp+pearson+pvalue \
+  --current > /tmp/rpcmci-round2-final.json
+"${rpcmci_benchmark[@]}" --baseline f788f5d --patches tests/leaderboard/rpcmci_round2_variants.json \
+  --variants --current --skip-checks > /tmp/rpcmci-round2-isolated.json
+```

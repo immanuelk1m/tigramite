@@ -22,7 +22,7 @@ import time
 BASELINE = "9cdba1343fd4763da72d2b04e9687c75d4318051"
 PATCH_FILE = "rpcmci_variants.json"
 CASES = ("tutorial", "multivariate", "repeat")
-LP_CASE_COUNT = 217
+LP_CASE_COUNT = 434
 THREAD_LIMITS = {
     name: "1" for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
                             "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
@@ -111,6 +111,7 @@ def lp_solver():
 
 
 def lp_check():
+    import inspect
     import numpy as np
     from ortools.linear_solver import linear_solver_pb2, pywraplp
     from types import SimpleNamespace
@@ -135,7 +136,12 @@ def lp_check():
                   for k, t, tr in shapes for _ in range(5)]
         cases += [(rng.integers(0, 3, size=(2, 500)).astype(float), 4)]
         owner = SimpleNamespace(verbosity=0)
-        outputs = [digest(solver(owner, cost, bound)) for cost, bound in cases]
+        supports_templates = "model_cache" in inspect.signature(solver).parameters
+        outputs = []
+        for cost, bound in cases:
+            options = {"model_cache": {}} if supports_templates else {}
+            for objective in (cost, np.zeros_like(cost)):
+                outputs.append(digest(solver(owner, objective, bound, **options)))
         return {"models": models, "outputs": outputs}
     finally:
         pywraplp.Solver.Solve = original_solve
@@ -258,7 +264,10 @@ def main(args):
         names.append("current")
     with tempfile.TemporaryDirectory(prefix="rpcmci-ablation-") as temp:
         temp = Path(temp)
-        archive = subprocess.check_output(["git", "archive", BASELINE, "tigramite"], cwd=root)
+        baseline = subprocess.check_output(
+            ["git", "rev-parse", "--verify", f"{args.baseline}^{{commit}}"], cwd=root, text=True,
+        ).strip()
+        archive = subprocess.check_output(["git", "archive", baseline, "tigramite"], cwd=root)
         base = temp / "base"
         base.mkdir()
         with tarfile.open(fileobj=io.BytesIO(archive)) as git_archive:
@@ -330,7 +339,7 @@ def main(args):
         timings = summary(records, names) if args.rounds and exact else {}
         exact &= all(variant["equal"] for case in timings.values()
                      for variant in case["variants"].values())
-        output = {"baseline": BASELINE, "environment": environment_details(),
+        output = {"baseline": baseline, "environment": environment_details(),
                   "exact": exact, "checks": checks, "hits": hits, "timings": timings}
         json.dump(output, sys.stdout, indent=2)
         print()
@@ -343,6 +352,7 @@ if __name__ == "__main__":
         worker()
     else:
         parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--baseline", default=BASELINE)
         parser.add_argument("--patches", type=Path, default=Path(__file__).with_name(PATCH_FILE))
         parser.add_argument("--variants", nargs="*", default=["1", "2", "3", "4ci", "4pred"])
         parser.add_argument("--rounds", type=int, default=10)

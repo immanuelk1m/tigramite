@@ -8,7 +8,7 @@ from copy import deepcopy
 import numpy as np
 import sklearn
 from joblib import Parallel, delayed
-from ortools.linear_solver import pywraplp
+from ortools.linear_solver import linear_solver_pb2, pywraplp
 import traceback
 
 from tigramite.independence_tests.parcorr import ParCorr
@@ -166,7 +166,7 @@ class RPCMCI(PCMCI):
             pcmci_parents = self.return_parents_dict(graph=graph, val_matrix=results['val_matrix'])
             return results, graph, pcmci_parents
 
-        def _optimize_gamma(resid_sq, max_transitions):
+        def _optimize_gamma(resid_sq, max_transitions, model_cache=None):
             r"""
             Solves the following optimization problem :
 
@@ -192,47 +192,117 @@ class RPCMCI(PCMCI):
 
             num_regimes, T = resid_sq.shape
 
-            # Create the linear solver with the GLOP backend.
-            solver = pywraplp.Solver.CreateSolver("GLOP")
-            infinity = solver.infinity()
+            # Proto loading drops unconstrained rows and validates coefficients.
+            # Preserve the original builder at these numeric boundaries.
+            use_template = (
+                ((type(max_transitions) is int and abs(max_transitions) <= 2**53)
+                 or (type(max_transitions) is float and np.isfinite(max_transitions)))
+                and num_regimes > 0 and T > 0
+                and np.isfinite(resid_sq).all()
+            )
+            if use_template:
+                # Each annealing owns its model template; each solve starts afresh.
+                if model_cache is None:
+                    model_cache = {}
+                if not model_cache:
+                    model = linear_solver_pb2.MPModelProto(
+                        maximize=False, objective_offset=0.0, name="")
+                    num_gamma = num_regimes * T
+                    infinity = float("inf")
+                    for i in range(num_gamma):
+                        model.variable.add(lower_bound=0.0, upper_bound=1.0,
+                                           is_integer=False, name=f"x_{i}")
+                    for i in range(num_gamma - 1):
+                        model.variable.add(lower_bound=0.0, upper_bound=infinity,
+                                           is_integer=False, name=f"eta_{i}")
 
-            # Define vector of integer variables in the interval [0,1].
-            G = [solver.NumVar(0, 1, f"x_{i}") for i in range(num_regimes * T)]
+                    def add_constraint(lower_bound, upper_bound, indices, coefficients):
+                        row = model.constraint.add(
+                            lower_bound=lower_bound, upper_bound=upper_bound,
+                            name=f"auto_c_{len(model.constraint):09d}", is_lazy=False)
+                        row.var_index.extend(indices)
+                        row.coefficient.extend(coefficients)
 
-            # Define eta, auxiliary vars for constr. (2).
-            E = [solver.NumVar(0, infinity, f"eta_{i}") for i in range(num_regimes * T - 1)]
-            # Match the existing GLOP model, including duplicate persistence
-            # rows and coefficient order, without building Python linear expressions.
-            objective = solver.Objective()
-            objective.SetMinimization()
-            for variable, coefficient in zip(G, resid_sq.flat):
-                objective.SetCoefficient(variable, 0.0 + float(coefficient))
+                    for t in range(T):
+                        add_constraint(1.0, 1.0, range(t, num_gamma, T),
+                                       [1.0] * num_regimes)
 
-            for t in range(T):
-                constraint = solver.RowConstraint(1, 1, "")
+                    upper_bound = infinity
+                    if num_regimes and T > 1 and max_transitions < infinity:
+                        upper_bound = max_transitions - 0.0
+                    persistence_coefficients = [1.0] * (T - 1)
+                    for k in range(num_regimes):
+                        offset = k * T
+                        eta_indices = range(num_gamma + offset,
+                                            num_gamma + offset + T - 1)
+                        for t, eta_index in enumerate(eta_indices):
+                            indices = (offset + t, offset + t + 1, eta_index)
+                            # ExportModelToProto stores each row in column order.
+                            add_constraint(-infinity, 0.0, indices, (-1.0, 1.0, -1.0))
+                            add_constraint(-infinity, 0.0, indices, (1.0, -1.0, -1.0))
+                            # Preserve duplicate persistence rows for identical GLOP
+                            # tie-breaking, while avoiding per-coefficient SWIG calls.
+                            add_constraint(-infinity, upper_bound, eta_indices,
+                                           persistence_coefficients)
+                    model_cache["model"] = model
+
+                model = model_cache["model"]
+                for variable, coefficient in zip(model.variable, resid_sq.flat):
+                    coefficient = 0.0 + float(coefficient)
+                    if coefficient == 0.0:
+                        variable.ClearField("objective_coefficient")
+                    else:
+                        variable.objective_coefficient = coefficient
+
+                solver = pywraplp.Solver.CreateSolver("GLOP")
+                # Generated names are unique, and this API preserves them on OR-Tools 9.2+.
+                error = solver.LoadModelFromProtoWithUniqueNamesOrDie(model)
+                if error:
+                    raise ValueError("The problem does not have an optimal solution. Please change hyperparameters.")
+                G = solver.variables()[:num_regimes * T]
+
+            else:
+                # Create the linear solver with the GLOP backend.
+                solver = pywraplp.Solver.CreateSolver("GLOP")
+                infinity = solver.infinity()
+
+                # Define vector of integer variables in the interval [0,1].
+                G = [solver.NumVar(0, 1, f"x_{i}") for i in range(num_regimes * T)]
+
+                # Define eta, auxiliary vars for constr. (2).
+                E = [solver.NumVar(0, infinity, f"eta_{i}") for i in range(num_regimes * T - 1)]
+                # Match the existing GLOP model, including duplicate persistence
+                # rows and coefficient order, without building Python linear expressions.
+                objective = solver.Objective()
+                objective.SetMinimization()
+                for variable, coefficient in zip(G, resid_sq.flat):
+                    objective.SetCoefficient(variable, 0.0 + float(coefficient))
+
+                for t in range(T):
+                    constraint = solver.RowConstraint(1, 1, "")
+                    for k in range(num_regimes):
+                        constraint.SetCoefficient(G[k * T + t], 1.0)
+
+                upper_bound = infinity
+                if num_regimes and T > 1 and max_transitions < infinity:
+                    upper_bound = max_transitions - 0.0
                 for k in range(num_regimes):
-                    constraint.SetCoefficient(G[k * T + t], 1.0)
+                    offset = k * T
+                    eta_variables = E[offset:offset + T - 1]
+                    for t, eta in enumerate(eta_variables):
+                        left, right = G[offset + t], G[offset + t + 1]
+                        constraint = solver.RowConstraint(-infinity, 0, "")
+                        constraint.SetCoefficient(right, 1.0)
+                        constraint.SetCoefficient(left, -1.0)
+                        constraint.SetCoefficient(eta, -1.0)
+                        constraint = solver.RowConstraint(-infinity, 0, "")
+                        constraint.SetCoefficient(right, -1.0)
+                        constraint.SetCoefficient(left, 1.0)
+                        constraint.SetCoefficient(eta, -1.0)
 
-            upper_bound = infinity
-            if num_regimes and T > 1 and max_transitions < infinity:
-                upper_bound = max_transitions - 0.0
-            for k in range(num_regimes):
-                offset = k * T
-                eta_variables = E[offset:offset + T - 1]
-                for t, eta in enumerate(eta_variables):
-                    left, right = G[offset + t], G[offset + t + 1]
-                    constraint = solver.RowConstraint(-infinity, 0, "")
-                    constraint.SetCoefficient(right, 1.0)
-                    constraint.SetCoefficient(left, -1.0)
-                    constraint.SetCoefficient(eta, -1.0)
-                    constraint = solver.RowConstraint(-infinity, 0, "")
-                    constraint.SetCoefficient(right, -1.0)
-                    constraint.SetCoefficient(left, 1.0)
-                    constraint.SetCoefficient(eta, -1.0)
-
-                    constraint = solver.RowConstraint(-infinity, upper_bound, "")
-                    for eta_variable in eta_variables:
-                        constraint.SetCoefficient(eta_variable, 1.0)
+                        constraint = solver.RowConstraint(-infinity, upper_bound, "")
+                        for eta_variable in eta_variables:
+                            constraint.SetCoefficient(eta_variable, 1.0)
 
             status = solver.Solve()
             if status == pywraplp.Solver.OPTIMAL:
@@ -253,6 +323,7 @@ class RPCMCI(PCMCI):
                 print(f"\n################# Annealing iteration a = {a} ####################\n")
 
             T = self.dataframe.T[0]
+            model_cache = {}
 
             # Initialise gamma_0 as random matrix of 1s and 0s
             random_state = np.random.default_rng(self.seed + a)
@@ -387,7 +458,7 @@ class RPCMCI(PCMCI):
 
                 try:
                     # Optimization
-                    gamma_opt, objective_opt = _optimize_gamma(res_sq, max_transitions)
+                    gamma_opt, objective_opt = _optimize_gamma(res_sq, max_transitions, model_cache)
 
                 except Exception:
                     traceback.print_exc()

@@ -12,6 +12,7 @@ pytest.importorskip("networkx")
 
 from joblib import parallel_backend
 from ortools.linear_solver import linear_solver_pb2, pywraplp
+from scipy import stats
 from sklearn.linear_model import LinearRegression
 from threadpoolctl import threadpool_limits
 
@@ -171,11 +172,12 @@ def test_custom_estimators_receive_every_regime_fit_and_test(values):
     assert len(RecordingParCorr.calls) > 0
 
 
-def test_lp_preserves_original_model_and_solution(values, monkeypatch):
+@pytest.mark.parametrize("max_transitions", [2, np.int64(2), float("inf"), 10**100])
+def test_lp_preserves_original_model_and_solution(values, monkeypatch, max_transitions):
     """Keep the original ordered LP, including duplicate persistence rows."""
     original_solve = pywraplp.Solver.Solve
-    checked_models = []
-    num_regimes, length, max_transitions = 2, len(values), 2
+    checked_statuses = []
+    num_regimes, length = 2, len(values)
 
     def checked_solve(solver, *args, **kwargs):
         model = linear_solver_pb2.MPModelProto()
@@ -204,14 +206,95 @@ def test_lp_preserves_original_model_and_solution(values, monkeypatch):
         expected_status = original_solve(reference, *args, **kwargs)
         status = original_solve(solver, *args, **kwargs)
         assert status == expected_status
-        assert_identical(solver.Objective().Value(), reference.Objective().Value())
-        assert_identical(np.array([v.solution_value() for v in solver.variables()]),
-                         np.array([v.solution_value() for v in reference.variables()]))
-        checked_models.append(model)
+        if status == pywraplp.Solver.OPTIMAL:
+            assert_identical(solver.Objective().Value(), reference.Objective().Value())
+            assert_identical(np.array([v.solution_value() for v in solver.variables()]),
+                             np.array([v.solution_value() for v in reference.variables()]))
+        checked_statuses.append(status)
         return status
 
     monkeypatch.setattr(pywraplp.Solver, "Solve", checked_solve)
     result = run(RPCMCI(DataFrame(values.copy()), seed=17), num_regimes=num_regimes,
                  max_transitions=max_transitions, num_iterations=1, max_anneal=1)
-    assert result is not None
-    assert len(checked_models) == 1
+    assert len(checked_statuses) == 1
+    assert (result is not None) == (checked_statuses[0] == pywraplp.Solver.OPTIMAL)
+
+
+@pytest.mark.parametrize("dtype", [float, np.float32, np.float64, np.longdouble])
+def test_parcorr_analytic_significance_matches_distribution(dtype):
+    test = ParCorr()
+    one, zero = dtype(1), dtype(0)
+    correlations = [-one, -np.nextafter(one, zero), dtype(-0.45), zero,
+                    dtype(0.45), np.nextafter(one, zero), one, dtype(np.nan)]
+    for value in correlations:
+        for dof in (0, 1, 17, 498, 2**64):
+            if dof < 1:
+                expected = np.nan
+            elif abs(value) == 1:
+                expected = 0.0
+            else:
+                try:
+                    t = value * np.sqrt(dof / (1. - value * value))
+                    expected = stats.t.sf(np.abs(t), dof) * 2
+                except TypeError as error:
+                    with pytest.raises(TypeError) as raised:
+                        test.get_analytic_significance(value, T=dof + 2, dim=2, xyz=None)
+                    assert str(raised.value) == str(error)
+                    continue
+            actual = test.get_analytic_significance(value, T=dof + 2, dim=2, xyz=None)
+            assert_identical(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("shape", [(2, 2), (2, 120), (5, 120)])
+def test_parcorr_statistic_matches_scipy_residual_correlation(dtype, shape):
+    test = ParCorr()
+    data = np.random.default_rng(31).normal(size=shape).astype(dtype)
+    reference = data.copy()
+    x = test._get_single_residuals(reference, 0)
+    y = test._get_single_residuals(reference, 1)
+    expected = stats.pearsonr(x, y).statistic
+    assert_identical(test.get_dependence_measure(data, xyz=None), expected)
+    assert_identical(data, reference)
+
+
+def test_parcorr_preserves_scipy_dispatch_and_near_constant_warning(monkeypatch):
+    test = ParCorr()
+    x = 1. + np.spacing(1.) * np.arange(8)
+    y = np.arange(8, dtype=float)[::-1]
+    inputs = (x, y)
+    monkeypatch.setattr(test, "_get_single_residuals",
+                        lambda array, target_var: inputs[target_var])
+    with pytest.warns(stats.NearConstantInputWarning):
+        expected = stats.pearsonr(x, y).statistic
+    with pytest.warns(stats.NearConstantInputWarning):
+        actual = test.get_dependence_measure(np.empty((2, 8)), xyz=None)
+    assert_identical(actual, expected)
+
+    monkeypatch.setattr(stats, "pearsonr", lambda x, y: (np.float64(0.125), None))
+    assert_identical(test.get_dependence_measure(np.empty((2, 8)), xyz=None), np.float64(0.125))
+
+
+@pytest.mark.parametrize("constant", [False, True])
+def test_ci_array_preserves_constant_row_handling_and_copy(values, constant):
+    data = values.copy(order="F")
+    if constant:
+        data[:, 0] = 1.
+    test = ParCorr()
+    test.set_dataframe(DataFrame(data, data_type=np.zeros_like(data, dtype=int)))
+    result = test._get_array([(0, -1)], [(1, 0)], [(1, -1)],
+                             tau_max=1, remove_constant_data=True)
+    array, xyz, nodes, data_type, clean, clean_xyz, clean_nodes, clean_type = result
+    dropped = np.flatnonzero(array.std(axis=1) == 0)
+    assert dropped.size == int(constant)
+    expected_array = np.delete(array, dropped, axis=0)
+    expected_type = np.delete(data_type, dropped, axis=0)
+    assert_identical(clean, expected_array)
+    assert_identical(clean_xyz, np.delete(xyz, dropped))
+    assert_identical(clean_type, expected_type)
+    assert_identical(clean_nodes, (nodes[0] if not constant else [], nodes[1], nodes[2]))
+    assert clean.strides == expected_array.strides
+    assert clean_type.strides == expected_type.strides
+    assert not np.shares_memory(clean, array)
+    assert not np.shares_memory(clean_xyz, xyz)
+    assert not np.shares_memory(clean_type, data_type)
